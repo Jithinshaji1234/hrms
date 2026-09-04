@@ -1,5 +1,5 @@
 <template>
-	<div class="flex items-center">
+	<div class="flex items-center justify-between">
 		<!-- Month Change -->
 		<div class="flex items-center bg-gray-50 rounded-md space-x-0.5">
 			<Button icon="chevron-left" variant="ghost" @click="emit('addToMonth', -1)" />
@@ -10,35 +10,57 @@
 		</div>
 
 		<!-- Filters -->
-		<div class="ml-auto space-x-2.5 flex">
-			<div v-for="[key, value] of Object.entries(filters)" :key="key" class="w-40">
+		<div class="flex flex-wrap items-center justify-end gap-2.5">
+			<div v-for="[key, filter] of Object.entries(filters)" :key="key" class="filter-item w-40">
 				<FormControl
 					type="autocomplete"
 					:placeholder="toTitleCase(key)"
-					:options="value.options"
-					v-model="value.model"
-					:disabled="!value.options.length"
+					:options="filter.options"
+					v-model="filter.model"
+					:disabled="!filter.options.length"
 				/>
 			</div>
-			<Button icon="x" @click="Object.values(filters).forEach((d) => (d.model = null))" />
+
+			<!-- Field-driven filters: pick any Employee field instead of hardcoding one control per field -->
+			<DynamicEmployeeFilters
+				ref="dynamicFiltersRef"
+				:exclude-fields="pinnedFieldnames"
+				@update:filters="onDynamicFiltersChange"
+			/>
+
+			<Button icon="x" @click="clearAllFilters" />
 		</div>
 	</div>
 </template>
 
 <script setup lang="ts">
-import { reactive, watch } from "vue";
+import { reactive, ref, watch } from "vue";
 import { FormControl, createResource, createListResource } from "frappe-ui";
 import { Dayjs } from "dayjs";
 
 import { raiseToast } from "../utils";
+import DynamicEmployeeFilters from "./DynamicEmployeeFilters.vue";
 
-export type FilterField =
-	| "company"
-	| "department"
-	| "branch"
-	| "designation"
-	| "shift_type"
-	| "shift_location";
+// Filters with special behaviour (company gates the whole table, department
+// cascades from company) stay as dedicated pinned controls. Every other
+// Employee field is filterable through DynamicEmployeeFilters, which reads
+// the field list from the server instead of hardcoding it here.
+type PinnedField = "company" | "department" | "branch" | "designation" | "shift_type" | "shift_location";
+
+const pinnedFieldnames: PinnedField[] = [
+	"company",
+	"department",
+	"branch",
+	"designation",
+	"shift_type",
+	"shift_location",
+];
+
+type PinnedFilter = {
+	doctype: string;
+	options: string[];
+	model?: { value: string } | null;
+};
 
 const props = defineProps<{
 	firstOfMonth: Dayjs;
@@ -46,22 +68,25 @@ const props = defineProps<{
 
 const emit = defineEmits<{
 	(e: "addToMonth", change: number): void;
-	(e: "updateFilters", newFilters: { [K in FilterField]: string }): void;
+	(e: "updateFilters", newFilters: Record<string, string>): void;
 }>();
 
-const filters: {
-	[K in FilterField]: {
-		options: string[];
-		model?: { value: string } | null;
-	};
-} = reactive({
-	company: { options: [], model: null },
-	department: { options: [], model: null },
-	branch: { options: [], model: null },
-	designation: { options: [], model: null },
-	shift_type: { options: [], model: null },
-	shift_location: { options: [], model: null },
-});
+const PINNED_DOCTYPES: Record<PinnedField, string> = {
+	company: "Company",
+	department: "Department",
+	branch: "Branch",
+	designation: "Designation",
+	shift_type: "Shift Type",
+	shift_location: "Shift Location",
+};
+
+const filters: Record<PinnedField, PinnedFilter> = reactive(
+	Object.fromEntries(
+		pinnedFieldnames.map((field) => [field, { doctype: PINNED_DOCTYPES[field], options: [], model: null }]),
+	),
+) as Record<PinnedField, PinnedFilter>;
+
+let dynamicFilters: Record<string, string> = {};
 
 watch(
 	() => filters.company.model,
@@ -75,16 +100,26 @@ watch(
 );
 
 watch(filters, (val) => {
-	const newFilters = {
-		company: val.company.model?.value || "",
-		department: val.department.model?.value || "",
-		branch: val.branch.model?.value || "",
-		designation: val.designation.model?.value || "",
-		shift_type: val.shift_type.model?.value || "",
-		shift_location: val.shift_location.model?.value || "",
-	};
-	emit("updateFilters", newFilters);
+	const pinnedFilters = Object.fromEntries(
+		(Object.keys(val) as PinnedField[]).map((key) => [key, val[key].model?.value || ""]),
+	);
+	emit("updateFilters", { ...pinnedFilters, ...dynamicFilters });
 });
+
+const onDynamicFiltersChange = (newDynamicFilters: Record<string, string>) => {
+	dynamicFilters = newDynamicFilters;
+	const pinnedFilters = Object.fromEntries(
+		(Object.keys(filters) as PinnedField[]).map((key) => [key, filters[key].model?.value || ""]),
+	);
+	emit("updateFilters", { ...pinnedFilters, ...dynamicFilters });
+};
+
+const dynamicFiltersRef = ref<InstanceType<typeof DynamicEmployeeFilters>>();
+
+const clearAllFilters = () => {
+	Object.values(filters).forEach((d) => (d.model = null));
+	dynamicFiltersRef.value?.clearAll();
+};
 
 const toTitleCase = (str: string) =>
 	str
@@ -98,15 +133,13 @@ const defaultCompany = createResource({
 	url: "hrms.api.roster.get_default_company",
 	auto: true,
 	onSuccess: () => {
-		["company", "branch", "designation", "shift_type", "shift_location"].forEach((field) =>
-			getFilterOptions(field as FilterField),
-		);
+		pinnedFieldnames.forEach((field) => getFilterOptions(field));
 	},
 });
 
-const getFilterOptions = (field: FilterField, listFilters: { company?: string } = {}) => {
+const getFilterOptions = (field: PinnedField, listFilters: { company?: string } = {}) => {
 	createListResource({
-		doctype: toTitleCase(field),
+		doctype: filters[field].doctype,
 		fields: ["name"],
 		filters: listFilters,
 		pageLength: 100,
